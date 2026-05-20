@@ -1,0 +1,32 @@
+{
+  "name": "compact-fallback-rescue",
+  "version": "0.1.0",
+  "description": "Session-scoped Codex compact failure rescue. When enabled for one conversation, a local watcher can resume that session with gpt-5.4-mini after a remote compact failure, then switch back to the original model.",
+  "author": {
+    "name": "Local"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "compact",
+    "fallback",
+    "rescue"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Compact Fallback Rescue",
+    "shortDescription": "Rescue selected sessions after remote compact failures",
+    "longDescription": "Adds a local session-scoped watcher and commands for rescuing selected Codex conversations after remote compact failures. It does not change the global provider or hide existing history.",
+    "developerName": "Local",
+    "category": "Engineering",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Enable compact fallback rescue for this chat"
+    ],
+    "brandColor": "#334155",
+    "screenshots": []
+  }
+}
