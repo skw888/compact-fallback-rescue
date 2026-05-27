@@ -13,8 +13,33 @@ process.env.CODEX_RESCUE_DRY_RUN = "1";
 const rescue = await import(`../scripts/rescue.mjs?test=${Date.now()}`);
 
 test("detectCompactFailureLine matches remote compact stream errors only", () => {
+  const compactError = JSON.stringify({
+    type: "event_msg",
+    payload: {
+      type: "error",
+      message: "Error running remote compact task: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)"
+    }
+  });
+  const userMention = JSON.stringify({
+    type: "event_msg",
+    payload: {
+      type: "user_message",
+      message: "Why did I see Error running remote compact task: /responses/compact?"
+    }
+  });
+  const toolOutput = JSON.stringify({
+    type: "response_item",
+    payload: {
+      type: "function_call_output",
+      output: "README example: Error running remote compact task: stream disconnected before completion: /responses/compact"
+    }
+  });
+
+  assert.equal(rescue.detectCompactFailureLine(compactError), true);
+  assert.equal(rescue.detectCompactFailureLine(userMention), false);
+  assert.equal(rescue.detectCompactFailureLine(toolOutput), false);
   assert.equal(
-    rescue.detectCompactFailureLine("Error running remote compact task: stream disconnected before completion: /responses/compact"),
+    rescue.detectCompactFailureText("Error running remote compact task: stream disconnected before completion: /responses/compact"),
     true
   );
   assert.equal(rescue.detectCompactFailureLine("normal compact prose in a README"), false);

@@ -10,6 +10,7 @@ const PLUGIN_ROOT = path.dirname(SCRIPT_DIR);
 const STATE_PATH = process.env.CODEX_RESCUE_STATE_PATH ?? path.join(PLUGIN_ROOT, "state", "sessions.json");
 const LOG_PATH = process.env.CODEX_RESCUE_LOG_PATH ?? path.join(PLUGIN_ROOT, "logs", "watcher.log");
 const DRY_RUN_PATH = process.env.CODEX_RESCUE_DRY_RUN_PATH ?? path.join(PLUGIN_ROOT, "state", "dry-run.jsonl");
+const WATCHER_PID_PATH = process.env.CODEX_RESCUE_WATCHER_PID_PATH ?? path.join(PLUGIN_ROOT, "state", "watcher.pid");
 
 const DEFAULT_FALLBACK_MODEL = "gpt-5.4-mini";
 const DEFAULT_FALLBACK_PROMPT = "继续";
@@ -19,10 +20,19 @@ const DEFAULT_RESTORE_PROMPT =
 const DEFAULT_POLL_MS = 4000;
 const DEFAULT_QUIET_MS = 6000;
 const DEFAULT_MAX_SETTLE_MS = 45000;
-const DEFAULT_RESUME_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_RESUME_TIMEOUT_MS = 60 * 60 * 1000;
+const DEFAULT_RETRY_COOLDOWN_MS = 30 * 60 * 1000;
 
 export function detectCompactFailureLine(line) {
-  const lower = line.toLowerCase();
+  const message = compactFailureMessageFromTranscriptLine(line);
+  return message ? detectCompactFailureText(message) : false;
+}
+
+export function detectCompactFailureText(text) {
+  if (!text) {
+    return false;
+  }
+  const lower = text.toLowerCase();
   const hasCompactEndpoint = lower.includes("/responses/compact");
   const hasCompactTask = lower.includes("remote compact task") || lower.includes("compact task");
   const hasFailure =
@@ -33,6 +43,35 @@ export function detectCompactFailureLine(line) {
     lower.includes("error");
 
   return (hasCompactEndpoint || hasCompactTask) && hasFailure;
+}
+
+function compactFailureMessageFromTranscriptLine(line) {
+  let item;
+  try {
+    item = JSON.parse(line);
+  } catch {
+    return null;
+  }
+
+  if (item.type === "event_msg" && item.payload) {
+    const payloadType = String(item.payload.type ?? "").toLowerCase();
+    if (payloadType === "error" || payloadType === "stream_error") {
+      return [item.payload.message, item.payload.error, item.payload.reason]
+        .filter((value) => typeof value === "string" && value)
+        .join("\n");
+    }
+  }
+
+  if (item.type === "error" && item.payload) {
+    if (typeof item.payload === "string") {
+      return item.payload;
+    }
+    return [item.payload.message, item.payload.error, item.payload.reason]
+      .filter((value) => typeof value === "string" && value)
+      .join("\n");
+  }
+
+  return null;
 }
 
 export function sessionIdFromTranscriptPath(transcriptPath) {
@@ -171,6 +210,11 @@ export async function scanSessionOnce(session, options = {}) {
     return { changed: false, rescued: false };
   }
 
+  if (session.pendingFailure && pendingRetryDue(session)) {
+    await rescueSession(session, session.pendingFailure, options);
+    return { changed: true, rescued: true };
+  }
+
   if (!fs.existsSync(session.transcriptPath)) {
     logEvent("session_transcript_missing", { sessionId: session.sessionId, transcriptPath: session.transcriptPath });
     return { changed: false, rescued: false };
@@ -225,6 +269,10 @@ export async function rescueSession(session, failure, options = {}) {
 
   current.rescueInProgress = true;
   current.lastFailureFingerprint = failure.fingerprint;
+  current.pendingFailure = failure;
+  current.lastScannedSize = Number.isFinite(Number(session.lastScannedSize)) ? session.lastScannedSize : current.lastScannedSize;
+  current.lastRescueAttemptAt = new Date().toISOString();
+  delete current.nextRetryAt;
   current.updatedAt = new Date().toISOString();
   state.sessions[session.sessionId] = current;
   saveState(state);
@@ -257,6 +305,9 @@ export async function rescueSession(session, failure, options = {}) {
     const finalSession = finalState.sessions[current.sessionId] ?? current;
     finalSession.rescueInProgress = false;
     finalSession.lastHandledFingerprint = failure.fingerprint;
+    delete finalSession.pendingFailure;
+    delete finalSession.nextRetryAt;
+    delete finalSession.lastRescueError;
     finalSession.lastRescueAt = new Date().toISOString();
     finalSession.lastScannedSize = fs.existsSync(finalSession.transcriptPath)
       ? fs.statSync(finalSession.transcriptPath).size
@@ -269,8 +320,9 @@ export async function rescueSession(session, failure, options = {}) {
     const errorState = loadState();
     const errorSession = errorState.sessions[current.sessionId] ?? current;
     errorSession.rescueInProgress = false;
-    errorSession.lastHandledFingerprint = failure.fingerprint;
+    errorSession.pendingFailure = failure;
     errorSession.lastRescueError = publicError(error);
+    errorSession.nextRetryAt = new Date(Date.now() + retryCooldownMs(options)).toISOString();
     errorSession.updatedAt = new Date().toISOString();
     errorState.sessions[current.sessionId] = errorSession;
     saveState(errorState);
@@ -280,6 +332,14 @@ export async function rescueSession(session, failure, options = {}) {
 
 export async function watch(options = {}) {
   fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
+  writeWatcherPid();
+  process.once("exit", clearWatcherPid);
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.once(signal, () => {
+      clearWatcherPid();
+      process.exit(0);
+    });
+  }
   logEvent("watcher_started", { pid: process.pid });
 
   while (true) {
@@ -365,9 +425,12 @@ async function main(argv) {
     }
     case "status": {
       const state = loadState();
+      const watcher = readWatcherStatus();
       console.log(JSON.stringify({
         ok: true,
-        watcherPid: process.pid,
+        watcherPid: watcher.pid,
+        watcherRunning: watcher.running,
+        watcherPidPath: WATCHER_PID_PATH,
         statePath: STATE_PATH,
         sessions: Object.values(state.sessions)
       }, null, 2));
@@ -409,33 +472,33 @@ function findCodexBin() {
   const candidates = [];
   const localAppData = process.env.LOCALAPPDATA;
   if (localAppData) {
-    collectCodexBins(path.join(localAppData, "OpenAI", "Codex", "bin"), candidates);
+    collectCodexBins(path.join(localAppData, "OpenAI", "Codex", "bin"), candidates, 0);
   }
 
   const pathCandidates = String(process.env.PATH ?? "")
     .split(path.delimiter)
     .map((entry) => path.join(entry, process.platform === "win32" ? "codex.exe" : "codex"))
     .filter((candidate) => fs.existsSync(candidate));
-  candidates.push(...pathCandidates.map((candidate) => ({ path: candidate, mtimeMs: fs.statSync(candidate).mtimeMs })));
+  candidates.push(...pathCandidates.map((candidate) => ({ path: candidate, mtimeMs: fs.statSync(candidate).mtimeMs, priority: 1 })));
 
-  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  candidates.sort((a, b) => (a.priority ?? 1) - (b.priority ?? 1) || b.mtimeMs - a.mtimeMs);
   if (!candidates[0]) {
     throw new Error("Could not find codex executable");
   }
   return candidates[0].path;
 }
 
-function collectCodexBins(root, out) {
+function collectCodexBins(root, out, priority = 1) {
   if (!fs.existsSync(root)) {
     return;
   }
   for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
     const fullPath = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      collectCodexBins(fullPath, out);
+      collectCodexBins(fullPath, out, priority);
     } else if (entry.isFile() && entry.name.toLowerCase() === (process.platform === "win32" ? "codex.exe" : "codex")) {
       const stat = fs.statSync(fullPath);
-      out.push({ path: fullPath, mtimeMs: stat.mtimeMs });
+      out.push({ path: fullPath, mtimeMs: stat.mtimeMs, priority });
     }
   }
 }
@@ -526,10 +589,12 @@ function runProcess(command, args, { cwd, timeoutMs }) {
     let stderr = "";
     let timedOut = false;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
+    const timer = timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          child.kill();
+        }, timeoutMs)
+      : null;
 
     child.stdout.on("data", (chunk) => {
       stdout = trimCapture(stdout + chunk.toString("utf8"));
@@ -538,11 +603,15 @@ function runProcess(command, args, { cwd, timeoutMs }) {
       stderr = trimCapture(stderr + chunk.toString("utf8"));
     });
     child.on("error", (error) => {
-      clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+      }
       resolve({ exitCode: 1, stdout, stderr: `${stderr}\n${publicError(error)}` });
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+      }
       const exitCode = timedOut ? 124 : (code ?? 1);
       logEvent("resume_finished", {
         exitCode,
@@ -596,6 +665,55 @@ function logEvent(event, payload = {}) {
     event,
     ...payload
   });
+}
+
+function retryCooldownMs(options = {}) {
+  return options.retryCooldownMs ?? Number(process.env.CODEX_RESCUE_RETRY_COOLDOWN_MS ?? DEFAULT_RETRY_COOLDOWN_MS);
+}
+
+function pendingRetryDue(session) {
+  const retryAt = Date.parse(session.nextRetryAt ?? "");
+  return !Number.isFinite(retryAt) || Date.now() >= retryAt;
+}
+
+function writeWatcherPid() {
+  fs.mkdirSync(path.dirname(WATCHER_PID_PATH), { recursive: true });
+  fs.writeFileSync(WATCHER_PID_PATH, `${process.pid}\n`, "utf8");
+}
+
+function clearWatcherPid() {
+  try {
+    const pid = Number(fs.readFileSync(WATCHER_PID_PATH, "utf8").trim());
+    if (pid === process.pid) {
+      fs.unlinkSync(WATCHER_PID_PATH);
+    }
+  } catch {
+    // Best effort cleanup only.
+  }
+}
+
+function readWatcherStatus() {
+  let pid = null;
+  try {
+    pid = Number(fs.readFileSync(WATCHER_PID_PATH, "utf8").trim());
+  } catch {
+    return { pid: null, running: false };
+  }
+
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { pid: null, running: false };
+  }
+
+  return { pid, running: processExists(pid) };
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
 }
 
 function hashText(text) {

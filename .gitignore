@@ -2,6 +2,7 @@ node_modules/
 logs/
 state/*.json
 state/*.jsonl
+state/*.pid
 state/*.tmp
 *.log
 *.tmp
